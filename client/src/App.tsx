@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { nanoid } from 'nanoid';
-
-const SIGNAL_URL = 'ws://localhost:3001';
+import { startSignedRecording } from './recorder'
+import { getPresignedURL } from './api'
+const SIGNAL_URL = 'wss://signal.vreal-gallery.com';
 
 type SignalMessage =
   | { type: 'welcome'; id: string }
@@ -22,6 +23,10 @@ export default function App() {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
 
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const stopSignedRecordingRef = useRef<(() => void) | null>(null);
+  const [sessionId] = useState(() => nanoid());
+
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -36,7 +41,7 @@ export default function App() {
 
     ws.onopen = () => addLog('WS connected');
     ws.onclose = () => addLog('WS closed');
-    ws.onerror = (e) => addLog('WS error');
+    ws.onerror = () => addLog('WS error');
 
     ws.onmessage = async (ev) => {
       const msg: SignalMessage = JSON.parse(ev.data);
@@ -67,10 +72,12 @@ export default function App() {
         await handleSignal(msg.from, msg.data);
       }
     };
+    
   }
 
   async function setupMediaAndPC() {
     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localStreamRef.current = stream;
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = stream;
     }
@@ -146,6 +153,130 @@ export default function App() {
     dcRef.current?.send(msg);
     addLog(`You: ${msg}`);
   }
+  // id.ts
+ 
+
+  
+
+  
+  async function handleStartSignedRecording() {
+    try {
+      if (!connected) {
+        addLog('Join a room first.');
+        return;
+      }
+      const stream = localStreamRef.current;
+      if (!stream) {
+        addLog('No local stream yet.');
+        return;
+      }
+
+      // Minimal ES256 keypair (private key stays in-memory for prototype)
+      const keyPair = await window.crypto.subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign', 'verify']
+      );
+      
+      const uploader = async (path: string, data: Uint8Array | Blob) => {
+        const size = data instanceof Blob ? data.size : data.byteLength;
+        addLog(`(mock upload) ${path} (${size} bytes)`);
+       
+        const url = await getPresignedURL('vreal.webconf.114.101.97.108.32',
+          path,
+          'put_object'
+        );
+        if (!url) {
+          addLog("Failed to get presigned URL");
+          throw new Error("Failed to get presigned URL");
+        }
+        // example: const url = await fetch('/api/presign?path='+encodeURIComponent(path)).then(r => r.text());
+        // await fetch(url, { method:'PUT', body:data, headers:{'Content-Type': '' }});
+
+        try {
+          const res = await fetch(url, {
+            method: 'PUT',
+            body: data,
+            // headers: {
+            //   // pick correct type if Blob, otherwise fallback
+            //   // 'Content-Type':
+            //   //   data instanceof Blob ? data.type || 'application/octet-stream' : 'application/octet-stream'
+            // }
+          });
+        
+          if (res.ok) {
+            addLog(`Upload succeeded: ${url} (status ${res.status})`);
+          } else {
+            const text = await res.text(); // XML with <Code> and <Message>
+            addLog(`S3 403: ${text}`);
+            addLog(`Upload failed: ${url} (status ${res.status} ${res.statusText})`);
+          }
+        } catch (err: any) {
+          addLog(`Upload error: ${err?.message || err}`);
+        }
+        
+        return 'mock-etag';
+      };
+
+      // Use myId if available; otherwise a random id
+      const participantId = myId ?? `local-${nanoid(6)}`;
+
+      // Start parallel recording+signing
+      const stop = await startSignedRecording({
+        stream,
+        participantId,
+        sessionId,
+        uploader,
+        keyPair,
+        // mimeType: 'video/webm;codecs=vp9,opus',
+        timesliceMs: 10_000
+      });
+      connectAndSubscribe(sessionId, (msg) => {
+        addLog(`Update from server: ${msg}`);})
+
+      stopSignedRecordingRef.current = stop;
+      addLog('Signed recording started.');
+    } catch (e: any) {
+      addLog(`Start signed recording failed: ${e?.message || e}`);
+    }
+  }
+
+  const WS_URL = 'wss://{api-id}.execute-api.{region}.amazonaws.com/prod';
+
+function connectAndSubscribe(sessionId: string, onUpdate: (u: any) => void) {
+  const ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ action: 'subscribe', sessionId }));
+  };
+
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'verification') {
+        onUpdate(msg); // { sessionId, participantId, seq, status }
+      }
+    } catch (e) {
+      console.warn('bad message', e);
+    }
+  };
+
+  ws.onclose = () => console.log('ws closed');
+  ws.onerror = (e) => console.error('ws error', e);
+
+  return ws;
+}
+
+
+  function handleStopSignedRecording() {
+    if (stopSignedRecordingRef.current) {
+      stopSignedRecordingRef.current();
+      stopSignedRecordingRef.current = null;
+      addLog('Signed recording stopped.');
+    } else {
+      addLog('No signed recording is running.');
+    }
+  }
 
   return (
     <div style={{ fontFamily: 'ui-sans-serif', padding: 16, display: 'grid', gap: 12 }}>
@@ -154,6 +285,9 @@ export default function App() {
         <input value={room} onChange={(e) => setRoom(e.target.value)} placeholder="room id" />
         <button onClick={joinRoom} disabled={connected}>Join</button>
         <button onClick={sendChat} disabled={!connected}>Send test chat</button>
+        <button onClick={handleStartSignedRecording} disabled={!connected}>Start Signed Recording</button>
+        <button onClick={handleStopSignedRecording} disabled={!connected}>Stop Signed Recording</button>
+      
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
